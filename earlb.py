@@ -1,716 +1,713 @@
 #!/usr/bin/env python3
-"""
-Enhanced Adaptive Rotation Load Balancing (EARLB) Algorithm
-Modified to work with real sensor dataset
-"""
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-from datetime import datetime, timedelta
-import json
+
 import sys
 import os
+import random
+import numpy as np
+import pandas as pd
+from collections import defaultdict
+import time
 
-class EARLBNode:
-    """EARLB Node class for dataset-based simulation"""
+# NS-3 Python bindings import
+try:
+    import ns3
+    from ns3 import core, network, internet, applications, mobility, wifi, csma
+    NS3_AVAILABLE = True
+    print("NS-3 modules imported successfully")
+except ImportError as e:
+    print(f"NS-3 import error: {e}")
+    print("Please ensure NS-3 is properly installed with Python bindings")
+    sys.exit(1)
+
+# Simulation Parameters
+SIMULATION_SEED = 42
+AREA_SIZE = 100  # Network area in meters
+INIT_ENERGY = 2.0  # Initial energy in Joules
+BASE_STATION_POS = (AREA_SIZE / 2, 110)  # Base station position
+
+# Energy Model Parameters
+TX_ENERGY_PER_BIT = 50e-9  # Transmission energy per bit (J/bit)
+RX_ENERGY_PER_BIT = 50e-9  # Reception energy per bit (J/bit)
+FS_ENERGY = 10e-12  # Free space energy coefficient
+MP_ENERGY = 0.0013e-12  # Multipath energy coefficient
+PACKET_SIZE = 4000  # Packet size in bits
+IDLE_ENERGY = 0.0001  # Idle energy consumption (J/s)
+TIME_PER_BIT = 1e-6  # Time per bit transmission (seconds)
+DEADLINE = 0.1  # Real-time deadline (100 ms)
+
+class NS3WSNNode:
+    """Enhanced WSN Node class for NS-3 integration"""
     
-    def __init__(self, sensor_id, sensor_type, initial_battery=100):
-        self.sensor_id = sensor_id
+    def __init__(self, node_id, x, y, initial_battery=100, sensor_type=None):
+        self.id = node_id
+        self.x = float(x)
+        self.y = float(y)
+        self.energy = INIT_ENERGY
+        self.battery_level = float(initial_battery)
         self.sensor_type = sensor_type
-        self.initial_battery = initial_battery
-        self.current_battery = initial_battery
-        self.is_cluster_head = False
-        self.cluster_members = []
-        self.parent_ch = None
+        self.is_CH = False
+        self.cluster_head = None
+        self.prev_ch_id = None
+        self.alive = True
+        self.distance_to_bs = np.sqrt((self.x - BASE_STATION_POS[0])**2 + (self.y - BASE_STATION_POS[1])**2)
         
-        # Load balancing attributes
-        self.current_load = 0.0
-        self.processing_capacity = np.random.uniform(0.8, 1.5)
-        self.communication_cost = np.random.uniform(0.1, 0.3)
-        
-        # Performance metrics
+        # Data tracking
+        self.temperature = 0.0
+        self.pressure = 0.0
+        self.sensor_cycle = 0
         self.packets_sent = 0
         self.packets_received = 0
-        self.packets_dropped = 0
-        self.total_delay = 0.0
-        self.response_times = []
-        self.load_history = []
-        self.energy_history = []
+        self.data_records = []
         
-        # Energy consumption rates (adjusted for battery levels)
-        self.tx_power_rate = 0.5    # Battery % per transmission
-        self.rx_power_rate = 0.2    # Battery % per reception
-        self.idle_power_rate = 0.01 # Battery % per idle cycle
-        self.ch_extra_power = 0.3   # Additional CH power consumption
+        # NS-3 specific
+        self.ns3_node = None
+        self.ns3_device = None
         
-        # Sensor-specific attributes
-        self.last_temp = 0.0
-        self.last_pressure = 0.0
-        self.sensor_cycle = 0
-        self.is_active = True
-        
-    def update_from_sensor_data(self, temp_c, hpa_div_4, battery_level, sensor_cycle):
-        """Update node state from sensor data"""
-        self.last_temp = temp_c
-        self.last_pressure = hpa_div_4 * 4  # Convert back to hPa
-        self.current_battery = battery_level
-        self.sensor_cycle = sensor_cycle
-        
-        # Node dies if battery too low
-        if self.current_battery <= 5:
-            self.is_active = False
-            
-        self.energy_history.append(self.current_battery)
-        
-    def calculate_data_priority(self):
-        """Calculate data transmission priority based on sensor readings"""
-        # Higher priority for extreme temperature readings
-        temp_priority = 1.0
-        if self.last_temp < 0 or self.last_temp > 40:
-            temp_priority = 1.5
-        elif self.last_temp < 5 or self.last_temp > 35:
-            temp_priority = 1.3
-            
-        # Higher priority for abnormal pressure readings
-        pressure_priority = 1.0
-        if self.last_pressure < 950 or self.last_pressure > 1050:
-            pressure_priority = 1.4
-        elif self.last_pressure < 980 or self.last_pressure > 1020:
-            pressure_priority = 1.2
-            
-        return temp_priority * pressure_priority
-        
-    def consume_energy(self, amount):
-        """Consume battery energy"""
-        self.current_battery = max(0, self.current_battery - amount)
-        if self.current_battery <= 0:
-            self.is_active = False
-            
-    def get_energy_ratio(self):
-        """Get remaining energy ratio"""
-        return self.current_battery / self.initial_battery if self.initial_battery > 0 else 0
-        
-    def calculate_ch_probability(self):
-        """Calculate cluster head selection probability"""
-        if not self.is_active or self.current_battery <= 10:
-            return 0.0
-            
-        energy_factor = self.get_energy_ratio()
-        load_factor = max(0.1, 1.0 - (self.current_load / 10.0))
-        comm_factor = 1.0 - self.communication_cost
-        
-        # Bonus for certain sensor types
-        type_bonus = 1.2 if self.sensor_type in ['temperature', 'pressure'] else 1.0
-        
-        return (energy_factor * 0.4 + load_factor * 0.3 + comm_factor * 0.2 + type_bonus * 0.1)
-        
-    def send_packet(self, packet_size=64):
-        """Simulate packet transmission"""
-        if not self.is_active:
-            return False
-            
-        # Calculate energy consumption based on data priority
-        priority = self.calculate_data_priority()
-        energy_cost = self.tx_power_rate * (packet_size / 64.0) * priority
-        
-        if self.is_cluster_head:
-            energy_cost += self.ch_extra_power
-            
-        self.consume_energy(energy_cost)
-        
-        if self.is_active:
-            self.packets_sent += 1
-            self.current_load += packet_size / 1000.0
-            return True
-        else:
-            self.packets_dropped += 1
-            return False
-            
-    def receive_packet(self, packet_size=64):
-        """Simulate packet reception"""
-        if not self.is_active:
-            return False
-            
-        energy_cost = self.rx_power_rate * (packet_size / 64.0)
-        
-        if self.is_cluster_head:
-            energy_cost += self.ch_extra_power
-            
-        self.consume_energy(energy_cost)
-        
-        if self.is_active:
-            self.packets_received += 1
-            self.current_load += packet_size / 2000.0  # CH processes more efficiently
-            return True
-        else:
-            self.packets_dropped += 1
-            return False
-            
-    def idle_cycle(self):
-        """Simulate idle energy consumption"""
-        if self.is_active:
-            self.consume_energy(self.idle_power_rate)
-            # Process current load
-            processed = min(self.current_load, self.processing_capacity * 0.1)
-            self.current_load = max(0, self.current_load - processed)
-            self.load_history.append(self.current_load)
-
-class EARLBDatasetSimulation:
-    """EARLB simulation using real sensor dataset"""
+    def is_alive(self):
+        """Check if node is alive"""
+        return self.alive and self.energy > 0 and self.battery_level > 0
     
-    def __init__(self, dataset_path):
-        self.dataset_path = dataset_path
-        self.nodes = {}
-        self.sensor_data = None
-        self.current_chs = set()
-        self.ch_rotation_interval = 100  # Number of data points
-        self.time_step = 0
+    def distance_to(self, other_node):
+        """Calculate distance to another node"""
+        return np.sqrt((self.x - other_node.x)**2 + (self.y - other_node.y)**2)
+    
+    def update_battery(self, new_level):
+        """Update battery level and corresponding energy"""
+        self.battery_level = max(0.0, float(new_level))
+        self.energy = INIT_ENERGY * (self.battery_level / 100.0)
+        if self.battery_level <= 0:
+            self.alive = False
+    
+    def update_sensor_data(self, temp_c, hpa_div_4, sensor_cycle):
+        """Update sensor readings"""
+        self.temperature = float(temp_c)
+        self.pressure = float(hpa_div_4)
+        self.sensor_cycle = int(sensor_cycle)
+    
+    def consume_transmission_energy(self, distance):
+        """Calculate and consume energy for transmission"""
+        if not self.is_alive():
+            return 0.0
         
-        # Metrics storage (keeping same structure as original)
-        self.metrics = {
-            'packet_drop': [],
-            'delay': [],
-            'network_lifetime': [],
-            'throughput': [],
-            'energy_consumption': [],
-            'response_time': [],
-            'load_efficiency': [],
-            'cluster_stability': [],
-            'pdr': [],
-            'scalability': [],
+        # Energy consumption model
+        d_threshold = 75  # Distance threshold for energy model
+        if distance < d_threshold:
+            energy = TX_ENERGY_PER_BIT * PACKET_SIZE + FS_ENERGY * PACKET_SIZE * (distance ** 2)
+        else:
+            energy = TX_ENERGY_PER_BIT * PACKET_SIZE + MP_ENERGY * PACKET_SIZE * (distance ** 4)
+        
+        # Apply energy consumption
+        self.energy -= energy
+        battery_drain = (energy / INIT_ENERGY) * 5.0  # Battery drain factor
+        self.battery_level -= battery_drain
+        
+        # Check if node dies
+        if self.energy <= 0 or self.battery_level <= 0:
+            self.alive = False
+            
+        return PACKET_SIZE * TIME_PER_BIT  # Return transmission delay
+    
+    def consume_reception_energy(self):
+        """Calculate and consume energy for reception"""
+        if not self.is_alive():
+            return 0.0
+        
+        energy = RX_ENERGY_PER_BIT * PACKET_SIZE
+        self.energy -= energy
+        battery_drain = (energy / INIT_ENERGY) * 2.0  # Battery drain factor
+        self.battery_level -= battery_drain
+        
+        # Check if node dies
+        if self.energy <= 0 or self.battery_level <= 0:
+            self.alive = False
+            
+        return PACKET_SIZE * TIME_PER_BIT  # Return reception delay
+    
+    def consume_idle_energy(self):
+        """Consume idle energy"""
+        if not self.is_alive():
+            return
+        
+        self.energy -= IDLE_ENERGY
+        self.battery_level -= 0.01  # Small battery drain for idle
+        
+        if self.energy <= 0 or self.battery_level <= 0:
+            self.alive = False
+
+class NS3HEEDSimulation:
+    """NS-3 integrated HEED simulation with dataset analysis"""
+    
+    def __init__(self):
+        self.nodes = {}
+        self.round_num = 0
+        self.total_transmissions = 0
+        self.ns3_nodes = None
+        self.ns3_devices = None
+        
+        # Initialize statistics tracking
+        self.stats = {
             'alive_nodes': [],
-            'simulation_time': []
+            'total_energy': [],
+            'chs_per_round': [],
+            'delivered_packets': [],
+            'dropped_packets': [],
+            'cluster_switches': [],
+            'load_distribution': [],
+            'round_delay': [],
+            'met_deadline_packets': [],
+            'missed_deadline_packets': [],
+            'real_time_ratio': [],
+            'pdr_over_time': [],
+            'first_death': None,
+            'last_death': None
         }
         
-        # Load and preprocess dataset
-        self.load_dataset()
-        self.initialize_nodes()
-        
-    def load_dataset(self):
-        """Load and preprocess the sensor dataset"""
-        print(f"Loading dataset from {self.dataset_path}...")
-        
+        # Initialize NS-3 environment
+        self.setup_ns3_environment()
+    
+    def setup_ns3_environment(self):
+        """Initialize NS-3 simulation environment"""
         try:
-            # Read CSV file
-            self.sensor_data = pd.read_csv(self.dataset_path)
+            # Set random seed for reproducibility
+            ns3.core.RngSeedManager.SetSeed(SIMULATION_SEED)
+            ns3.core.RngSeedManager.SetRun(1)
+            
+            # Enable logging (optional)
+            ns3.core.LogComponentEnable("UdpEchoClientApplication", ns3.core.LOG_LEVEL_INFO)
+            ns3.core.LogComponentEnable("UdpEchoServerApplication", ns3.core.LOG_LEVEL_INFO)
+            
+            print("NS-3 environment initialized successfully")
+            
+        except Exception as e:
+            print(f"Error setting up NS-3 environment: {e}")
+            raise
+    
+    def load_and_validate_dataset(self, file_path):
+        """Load and validate the dataset"""
+        try:
+            if not os.path.exists(file_path):
+                raise FileNotFoundError(f"Dataset file not found: {file_path}")
+            
+            # Load dataset
+            print(f"Loading dataset from: {file_path}")
+            df = pd.read_csv(file_path)
+            print(f"Dataset loaded: {len(df)} records")
             
             # Validate required columns
-            required_cols = ['sort_id', 'date_d_m_y', 'time', 'sensor_id', 
-                           'sensor_type', 'temp_C', 'hpa_div_4', 'batterylevel', 'sensor_cycle']
+            required_cols = ['sort_id', 'date_d_m_y', 'time', 'sensor_id', 'sensor_type', 
+                           'temp_C', 'hpa_div_4', 'batterylevel', 'sensor_cycle']
+            missing_cols = [col for col in required_cols if col not in df.columns]
             
-            missing_cols = [col for col in required_cols if col not in self.sensor_data.columns]
             if missing_cols:
                 raise ValueError(f"Missing required columns: {missing_cols}")
-                
-            # Create datetime column
-            self.sensor_data['datetime'] = pd.to_datetime(
-                self.sensor_data['date_d_m_y'] + ' ' + self.sensor_data['time'],
-                format='%d/%m/%Y %H:%M:%S'
-            )
             
-            # Sort by datetime and sort_id
-            self.sensor_data = self.sensor_data.sort_values(['datetime', 'sort_id'])
+            # Data preprocessing
+            print("Preprocessing dataset...")
             
-            # Handle missing values
-            self.sensor_data['temp_C'].fillna(self.sensor_data['temp_C'].mean(), inplace=True)
-            self.sensor_data['hpa_div_4'].fillna(self.sensor_data['hpa_div_4'].mean(), inplace=True)
-            self.sensor_data['batterylevel'].fillna(100, inplace=True)
+            # Convert datetime
+            df['datetime'] = pd.to_datetime(df['date_d_m_y'] + ' ' + df['time'], 
+                                         format='%d/%m/%Y %H:%M:%S', errors='coerce')
             
-            print(f"Dataset loaded successfully!")
-            print(f"Total records: {len(self.sensor_data)}")
-            print(f"Unique sensors: {self.sensor_data['sensor_id'].nunique()}")
-            print(f"Time range: {self.sensor_data['datetime'].min()} to {self.sensor_data['datetime'].max()}")
+            # Remove invalid datetime entries
+            initial_count = len(df)
+            df = df.dropna(subset=['datetime'])
+            print(f"Removed {initial_count - len(df)} records with invalid datetime")
+            
+            # Sort by datetime and sensor_id
+            df = df.sort_values(['datetime', 'sensor_id'])
+            
+            # Clean numeric columns
+            numeric_cols = ['temp_C', 'hpa_div_4', 'batterylevel', 'sensor_cycle']
+            for col in numeric_cols:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+            
+            # Remove rows with invalid numeric data
+            initial_count = len(df)
+            df = df.dropna(subset=numeric_cols)
+            print(f"Removed {initial_count - len(df)} records with invalid numeric data")
+            
+            # Validate battery levels (should be 0-100)
+            df = df[(df['batterylevel'] >= 0) & (df['batterylevel'] <= 100)]
+            
+            # Get unique sensors
+            unique_sensors = df['sensor_id'].unique()
+            print(f"Found {len(unique_sensors)} unique sensors")
+            print(f"Date range: {df['datetime'].min()} to {df['datetime'].max()}")
+            
+            return df
             
         except Exception as e:
             print(f"Error loading dataset: {e}")
-            sys.exit(1)
+            return None
+    
+    def initialize_ns3_nodes(self, df):
+        """Initialize NS-3 nodes from dataset"""
+        try:
+            # Get unique sensors and their initial data
+            sensor_info = df.groupby('sensor_id').agg({
+                'sensor_type': 'first',
+                'batterylevel': 'first',
+                'temp_C': 'first',
+                'hpa_div_4': 'first',
+                'sensor_cycle': 'first'
+            }).reset_index()
             
-    def initialize_nodes(self):
-        """Initialize nodes from dataset"""
-        print("Initializing nodes from dataset...")
-        
-        # Get unique sensors
-        unique_sensors = self.sensor_data[['sensor_id', 'sensor_type']].drop_duplicates()
-        
-        # Limit to 50 nodes as per original requirement
-        if len(unique_sensors) > 50:
-            unique_sensors = unique_sensors.head(50)
-            print(f"Limited to first 50 sensors out of {len(unique_sensors)} available")
+            num_nodes = len(sensor_info)
+            print(f"Initializing {num_nodes} NS-3 nodes...")
             
-        # Create nodes
-        for _, row in unique_sensors.iterrows():
-            sensor_id = row['sensor_id']
-            sensor_type = row['sensor_type']
+            # Create NS-3 node container
+            self.ns3_nodes = ns3.network.NodeContainer()
+            self.ns3_nodes.Create(num_nodes)
             
-            # Get initial battery level for this sensor
-            initial_battery = self.sensor_data[
-                self.sensor_data['sensor_id'] == sensor_id
-            ]['batterylevel'].iloc[0]
+            # Create mobility model
+            mobility = ns3.mobility.MobilityHelper()
+            mobility.SetMobilityModel("ns3::ConstantPositionMobilityModel")
             
-            node = EARLBNode(sensor_id, sensor_type, initial_battery)
-            self.nodes[sensor_id] = node
+            # Grid-based topology for better network structure
+            grid_size = int(np.ceil(np.sqrt(num_nodes)))
+            cell_size = AREA_SIZE / grid_size
             
-        print(f"Initialized {len(self.nodes)} nodes")
-        
-    def get_active_nodes(self):
-        """Get list of active nodes"""
-        return [node for node in self.nodes.values() if node.is_active]
-        
-    def select_cluster_heads(self):
-        """EARLB cluster head selection algorithm"""
-        active_nodes = self.get_active_nodes()
-        
-        if not active_nodes:
-            return
-            
-        # Calculate optimal number of CHs
-        optimal_ch_count = max(1, int(len(active_nodes) * 0.07))
-        
-        # Calculate probabilities
-        candidates = []
-        for node in active_nodes:
-            prob = node.calculate_ch_probability()
-            if prob > 0.1:
-                candidates.append((node, prob))
+            # Initialize nodes
+            for i, row in sensor_info.iterrows():
+                sensor_id = row['sensor_id']
+                sensor_type = row['sensor_type']
+                initial_battery = row['batterylevel']
                 
-        # Select CHs based on probability
-        candidates.sort(key=lambda x: x[1], reverse=True)
-        selected_chs = [node for node, _ in candidates[:optimal_ch_count]]
+                # Calculate position in grid with randomization
+                grid_x = i % grid_size
+                grid_y = i // grid_size
+                
+                x = grid_x * cell_size + random.uniform(5, cell_size - 5)
+                y = grid_y * cell_size + random.uniform(5, cell_size - 5)
+                
+                # Ensure within bounds
+                x = max(5, min(x, AREA_SIZE - 5))
+                y = max(5, min(y, AREA_SIZE - 5))
+                
+                # Create WSN node
+                node = NS3WSNNode(sensor_id, x, y, initial_battery, sensor_type)
+                node.update_sensor_data(row['temp_C'], row['hpa_div_4'], row['sensor_cycle'])
+                
+                # Set NS-3 node reference
+                node.ns3_node = self.ns3_nodes.Get(i)
+                
+                # Set position
+                pos = ns3.mobility.Vector(x, y, 0.0)
+                node.ns3_node.GetObject(ns3.mobility.MobilityModel.GetTypeId()).SetPosition(pos)
+                
+                self.nodes[sensor_id] = node
+                
+                if i < 10:  # Print first 10 nodes
+                    print(f"Node {sensor_id}: Pos({x:.1f},{y:.1f}), Type:{sensor_type}, Battery:{initial_battery}%")
+            
+            # Install mobility
+            mobility.Install(self.ns3_nodes)
+            
+            print(f"Successfully initialized {len(self.nodes)} nodes")
+            return True
+            
+        except Exception as e:
+            print(f"Error initializing NS-3 nodes: {e}")
+            return False
+    
+    def create_time_windows(self, df, window_minutes=30):
+        """Create time windows for simulation rounds"""
+        df['time_window'] = df['datetime'].dt.floor(f'{window_minutes}min')
+        time_windows = list(df.groupby('time_window'))
+        print(f"Created {len(time_windows)} time windows of {window_minutes} minutes each")
+        return time_windows
+    
+    def heed_cluster_formation(self, alive_nodes):
+        """HEED clustering algorithm implementation"""
+        cluster_heads = []
         
         # Reset CH status
-        for node in self.nodes.values():
-            node.is_cluster_head = False
-            node.cluster_members = []
-            
-        # Set new CHs
-        new_ch_set = set()
-        for ch_node in selected_chs:
-            ch_node.is_cluster_head = True
-            new_ch_set.add(ch_node.sensor_id)
-            
-        # Form clusters
-        self.form_clusters(selected_chs, active_nodes)
+        for node in alive_nodes:
+            node.is_CH = False
         
-        # Update CH tracking
-        self.current_chs = new_ch_set
-        
-    def form_clusters(self, cluster_heads, active_nodes):
-        """Form clusters around selected cluster heads"""
-        non_ch_nodes = [node for node in active_nodes if not node.is_cluster_head]
-        
-        for node in non_ch_nodes:
-            best_ch = None
-            best_score = float('inf')
+        # HEED CH election
+        for node in alive_nodes:
+            # Calculate factors for CH probability
+            energy_factor = node.energy / INIT_ENERGY
+            battery_factor = node.battery_level / 100.0
+            cycle_factor = max(0.1, 1.0 - (node.sensor_cycle / 1000.0))
             
-            for ch_node in cluster_heads:
-                # Calculate score based on energy, load, and sensor compatibility
-                energy_factor = ch_node.get_energy_ratio()
-                load_factor = max(0.1, 1.0 - (ch_node.current_load / 20.0))
+            # HEED probability calculation
+            ch_probability = min(1.0, 0.08 * energy_factor * battery_factor * cycle_factor)
+            
+            # CH selection
+            if random.random() < ch_probability:
+                node.is_CH = True
+                cluster_heads.append(node)
+        
+        # Ensure minimum number of CHs
+        if not cluster_heads:
+            # Select best nodes as CHs
+            alive_nodes.sort(key=lambda n: (n.energy * n.battery_level * (1000 - n.sensor_cycle)), reverse=True)
+            num_chs = max(1, len(alive_nodes) // 10)
+            cluster_heads = alive_nodes[:num_chs]
+            for ch in cluster_heads:
+                ch.is_CH = True
+        
+        return cluster_heads
+    
+    def simulate_transmission(self, sender, receiver):
+        """Simulate packet transmission between nodes"""
+        if not sender.is_alive() or not receiver.is_alive():
+            return False, 0.0
+        
+        # Calculate distance
+        distance = sender.distance_to(receiver)
+        
+        # Transmission energy and delay
+        tx_delay = sender.consume_transmission_energy(distance)
+        rx_delay = receiver.consume_reception_energy()
+        
+        # Update counters
+        sender.packets_sent += 1
+        
+        # Check if transmission successful
+        if sender.is_alive() and receiver.is_alive():
+            receiver.packets_received += 1
+            return True, tx_delay + rx_delay
+        
+        return False, 0.0
+    
+    def simulate_round(self, window_data, cluster_heads):
+        """Simulate one communication round"""
+        # Initialize round metrics
+        delivered_packets = 0
+        dropped_packets = 0
+        cluster_switches = 0
+        met_deadline = 0
+        missed_deadline = 0
+        total_delay = 0.0
+        load_distribution = defaultdict(int)
+        
+        # Process each data record in the window
+        for _, record in window_data.iterrows():
+            sensor_id = record['sensor_id']
+            self.total_transmissions += 1
+            
+            # Check if node exists and is alive
+            if sensor_id not in self.nodes:
+                dropped_packets += 1
+                continue
+            
+            node = self.nodes[sensor_id]
+            if not node.is_alive():
+                dropped_packets += 1
+                continue
+            
+            # Update node with current data
+            node.update_sensor_data(record['temp_C'], record['hpa_div_4'], record['sensor_cycle'])
+            
+            # Handle CH nodes
+            if node.is_CH:
+                # Direct transmission to base station
+                bs_distance = node.distance_to_bs
+                delay = node.consume_transmission_energy(bs_distance)
                 
-                # Preference for same sensor type
-                type_factor = 1.2 if node.sensor_type == ch_node.sensor_type else 1.0
-                
-                # Simulated distance factor
-                distance_factor = np.random.uniform(0.5, 2.0)
-                
-                score = distance_factor / (energy_factor * load_factor * type_factor)
-                
-                if score < best_score:
-                    best_score = score
-                    best_ch = ch_node
+                if node.is_alive():
+                    delivered_packets += 1
+                    total_delay += delay
+                    load_distribution[node.id] += 1
                     
-            if best_ch:
-                node.parent_ch = best_ch.sensor_id
-                best_ch.cluster_members.append(node.sensor_id)
+                    # Check deadline
+                    if delay <= DEADLINE:
+                        met_deadline += 1
+                    else:
+                        missed_deadline += 1
+                else:
+                    dropped_packets += 1
+            
+            # Handle non-CH nodes
+            else:
+                # Find alive cluster heads
+                alive_chs = [ch for ch in cluster_heads if ch.is_alive()]
+                if not alive_chs:
+                    dropped_packets += 1
+                    continue
                 
-    def process_time_step(self, time_step_data):
-        """Process one time step of sensor data"""
-        
-        # Update nodes with new sensor data
-        for _, row in time_step_data.iterrows():
-            sensor_id = row['sensor_id']
-            if sensor_id in self.nodes:
-                node = self.nodes[sensor_id]
-                node.update_from_sensor_data(
-                    row['temp_C'],
-                    row['hpa_div_4'],
-                    row['batterylevel'],
-                    row['sensor_cycle']
-                )
+                # Find closest CH
+                closest_ch = min(alive_chs, key=lambda ch: node.distance_to(ch))
                 
-        # Simulate communication
-        active_nodes = self.get_active_nodes()
-        for node in active_nodes:
-            # Send data packet
-            if node.send_packet():
-                # CH receives and processes
-                if node.parent_ch and node.parent_ch in self.nodes:
-                    ch_node = self.nodes[node.parent_ch]
-                    ch_node.receive_packet()
+                # Track cluster switching
+                if node.prev_ch_id is not None and node.prev_ch_id != closest_ch.id:
+                    cluster_switches += 1
+                node.prev_ch_id = closest_ch.id
+                
+                # Transmit to CH
+                success, delay1 = self.simulate_transmission(node, closest_ch)
+                
+                if success:
+                    load_distribution[closest_ch.id] += 1
                     
-            # Idle processing
-            node.idle_cycle()
-            
-        # Periodic CH selection
-        if self.time_step % self.ch_rotation_interval == 0:
-            self.select_cluster_heads()
-            
-    def collect_metrics(self):
-        """Collect metrics for current state"""
-        active_nodes = self.get_active_nodes()
+                    # CH forwards to base station
+                    bs_distance = closest_ch.distance_to_bs
+                    delay2 = closest_ch.consume_transmission_energy(bs_distance)
+                    
+                    if closest_ch.is_alive():
+                        total_round_delay = delay1 + delay2
+                        delivered_packets += 1
+                        total_delay += total_round_delay
+                        
+                        # Check deadline
+                        if total_round_delay <= DEADLINE:
+                            met_deadline += 1
+                        else:
+                            missed_deadline += 1
+                    else:
+                        dropped_packets += 1
+                else:
+                    dropped_packets += 1
         
-        # Basic communication metrics
-        total_packets_sent = sum(node.packets_sent for node in self.nodes.values())
-        total_packets_received = sum(node.packets_received for node in self.nodes.values())
-        total_packets_dropped = sum(node.packets_dropped for node in self.nodes.values())
+        # Calculate load distribution standard deviation
+        load_values = list(load_distribution.values()) if load_distribution else [0]
+        load_std = np.std(load_values)
         
-        # Calculate metrics
-        pdr = total_packets_received / max(1, total_packets_sent)
-        packet_drop_rate = total_packets_dropped / max(1, total_packets_sent)
+        return {
+            'delivered': delivered_packets,
+            'dropped': dropped_packets,
+            'switches': cluster_switches,
+            'met_deadline': met_deadline,
+            'missed_deadline': missed_deadline,
+            'total_delay': total_delay,
+            'load_std': load_std
+        }
+    
+    def update_statistics(self, round_results, cluster_heads):
+        """Update simulation statistics"""
+        # Node statistics
+        alive_count = sum(1 for node in self.nodes.values() if node.is_alive())
+        total_energy = sum(node.energy for node in self.nodes.values() if node.is_alive())
         
-        # Energy metrics
-        total_energy_consumed = sum(
-            node.initial_battery - node.current_battery 
-            for node in self.nodes.values()
-        )
-        avg_energy_consumption = total_energy_consumed / len(self.nodes)
+        # Update arrays
+        self.stats['alive_nodes'].append(alive_count)
+        self.stats['total_energy'].append(total_energy)
+        self.stats['chs_per_round'].append(len(cluster_heads))
+        self.stats['delivered_packets'].append(round_results['delivered'])
+        self.stats['dropped_packets'].append(round_results['dropped'])
+        self.stats['cluster_switches'].append(round_results['switches'])
+        self.stats['round_delay'].append(round_results['total_delay'])
+        self.stats['met_deadline_packets'].append(round_results['met_deadline'])
+        self.stats['missed_deadline_packets'].append(round_results['missed_deadline'])
+        self.stats['load_distribution'].append(round_results['load_std'])
         
-        # Load efficiency
-        loads = [node.current_load for node in active_nodes]
-        if loads:
-            load_variance = np.var(loads)
-            load_mean = np.mean(loads)
-            load_efficiency = 1.0 / (1.0 + load_variance / max(0.01, load_mean))
+        # Calculate ratios
+        total_packets = round_results['delivered'] + round_results['dropped']
+        if total_packets > 0:
+            pdr = round_results['delivered'] / total_packets
+            self.stats['pdr_over_time'].append(pdr)
         else:
-            load_efficiency = 0
-            
-        # Network lifetime
-        network_lifetime = len(active_nodes) / len(self.nodes)
+            self.stats['pdr_over_time'].append(0.0)
         
-        # Store metrics
-        self.metrics['packet_drop'].append(packet_drop_rate)
-        self.metrics['pdr'].append(pdr)
-        self.metrics['energy_consumption'].append(avg_energy_consumption)
-        self.metrics['load_efficiency'].append(load_efficiency)
-        self.metrics['alive_nodes'].append(len(active_nodes))
-        self.metrics['network_lifetime'].append(network_lifetime)
-        self.metrics['throughput'].append(total_packets_received)
-        self.metrics['simulation_time'].append(self.time_step)
+        if round_results['delivered'] > 0:
+            rt_ratio = round_results['met_deadline'] / round_results['delivered']
+            self.stats['real_time_ratio'].append(rt_ratio)
+        else:
+            self.stats['real_time_ratio'].append(0.0)
         
-    def run_simulation(self):
-        """Run the complete simulation using dataset"""
-        print("Starting EARLB dataset-based simulation...")
+        # Track node deaths
+        total_nodes = len(self.nodes)
+        if alive_count < total_nodes and self.stats['first_death'] is None:
+            self.stats['first_death'] = self.round_num
+        if alive_count == 0 and self.stats['last_death'] is None:
+            self.stats['last_death'] = self.round_num
+    
+    def run_simulation(self, dataset_path):
+        """Main simulation execution"""
+        print("=== Starting NS-3 HEED Simulation with Dataset ===")
         
-        # Group data by time steps
-        time_groups = self.sensor_data.groupby('datetime')
-        
-        print(f"Processing {len(time_groups)} time steps...")
-        
-        for timestamp, group_data in time_groups:
-            self.time_step += 1
-            
-            # Filter data for nodes we're tracking
-            relevant_data = group_data[group_data['sensor_id'].isin(self.nodes.keys())]
-            
-            if len(relevant_data) > 0:
-                # Process this time step
-                self.process_time_step(relevant_data)
-                
-                # Collect metrics every 10 time steps
-                if self.time_step % 10 == 0:
-                    self.collect_metrics()
-                    
-                # Progress indicator
-                if self.time_step % 100 == 0:
-                    active_count = len(self.get_active_nodes())
-                    print(f"Time step {self.time_step}: {active_count}/{len(self.nodes)} nodes active")
-                    
-            # Stop if no nodes are active
-            if not self.get_active_nodes():
-                print("All nodes have died. Simulation ended.")
-                break
-                
-        print("Simulation completed!")
-        return self.metrics
-        
-    def generate_report(self):
-        """Generate comprehensive simulation report"""
-        if not self.metrics['simulation_time']:
-            print("No metrics collected!")
+        # Load and validate dataset
+        df = self.load_and_validate_dataset(dataset_path)
+        if df is None:
+            print("Failed to load dataset. Exiting.")
             return None
+        
+        # Initialize NS-3 nodes
+        if not self.initialize_ns3_nodes(df):
+            print("Failed to initialize NS-3 nodes. Exiting.")
+            return None
+        
+        # Create time windows
+        time_windows = self.create_time_windows(df, window_minutes=30)
+        
+        print(f"Starting simulation with {len(self.nodes)} nodes and {len(time_windows)} time windows...")
+        
+        # Main simulation loop
+        for window_idx, (time_window, window_data) in enumerate(time_windows):
+            self.round_num += 1
             
-        report = {
-            'simulation_parameters': {
-                'dataset_path': self.dataset_path,
-                'num_nodes': len(self.nodes),
-                'total_time_steps': self.time_step,
-                'ch_rotation_interval': self.ch_rotation_interval,
-                'dataset_records': len(self.sensor_data)
-            },
-            'final_metrics': {},
-            'performance_summary': {}
+            # Progress reporting
+            if self.round_num % 10 == 0:
+                print(f"Processing round {self.round_num}/{len(time_windows)}...")
+            
+            # Update battery levels from current window
+            for sensor_id, sensor_data in window_data.groupby('sensor_id'):
+                if sensor_id in self.nodes:
+                    node = self.nodes[sensor_id]
+                    # Use most recent battery level
+                    latest_battery = sensor_data['batterylevel'].iloc[-1]
+                    node.update_battery(latest_battery)
+            
+            # Get alive nodes
+            alive_nodes = [node for node in self.nodes.values() if node.is_alive()]
+            
+            # Check for network death
+            if not alive_nodes:
+                print(f"All nodes died at round {self.round_num}")
+                self.stats['last_death'] = self.round_num
+                break
+            
+            # Apply idle energy consumption
+            for node in alive_nodes:
+                node.consume_idle_energy()
+            
+            # HEED cluster formation
+            cluster_heads = self.heed_cluster_formation(alive_nodes)
+            
+            # Simulate communication round
+            round_results = self.simulate_round(window_data, cluster_heads)
+            
+            # Update statistics
+            self.update_statistics(round_results, cluster_heads)
+            
+            # Periodic progress report
+            if self.round_num % 50 == 0:
+                alive_count = len(alive_nodes)
+                print(f"Round {self.round_num}: Alive={alive_count}, CHs={len(cluster_heads)}, "
+                      f"Delivered={round_results['delivered']}, Dropped={round_results['dropped']}")
+        
+        print(f"Simulation completed after {self.round_num} rounds")
+        
+        # Return results
+        return {
+            'stats': self.stats,
+            'total_rounds': self.round_num,
+            'total_nodes': len(self.nodes),
+            'final_alive_nodes': sum(1 for node in self.nodes.values() if node.is_alive())
         }
+    
+    def print_comprehensive_results(self, results):
+        """Print detailed simulation results"""
+        stats = results['stats']
+        total_rounds = results['total_rounds']
+        total_nodes = results['total_nodes']
+        final_alive = results['final_alive_nodes']
         
-        # Calculate final metrics
-        for metric_name, values in self.metrics.items():
-            if values and metric_name != 'simulation_time':
-                report['final_metrics'][metric_name] = {
-                    'final': values[-1],
-                    'average': np.mean(values),
-                    'std': np.std(values),
-                    'min': np.min(values),
-                    'max': np.max(values)
-                }
+        print("\n" + "="*80)
+        print("NS-3 HEED SIMULATION RESULTS")
+        print("="*80)
         
-        # Performance summary
-        final_alive = self.metrics['alive_nodes'][-1] if self.metrics['alive_nodes'] else 0
-        avg_pdr = np.mean(self.metrics['pdr']) if self.metrics['pdr'] else 0
-        avg_load_eff = np.mean(self.metrics['load_efficiency']) if self.metrics['load_efficiency'] else 0
+        # Basic simulation info
+        print(f"Simulation Overview:")
+        print(f"  Total nodes: {total_nodes}")
+        print(f"  Simulation rounds: {total_rounds}")
+        print(f"  Final alive nodes: {final_alive}")
+        print(f"  Network lifetime: {stats['last_death'] or 'Network still alive'}")
         
-        report['performance_summary'] = {
-            'network_lifetime_percentage': (final_alive / len(self.nodes)) * 100,
-            'average_pdr': avg_pdr,
-            'average_load_efficiency': avg_load_eff,
-            'total_energy_consumed': sum(
-                node.initial_battery - node.current_battery 
-                for node in self.nodes.values()
-            ),
-            'node_details': {
-                str(node.sensor_id): {
-                    'sensor_type': node.sensor_type,
-                    'initial_battery': node.initial_battery,
-                    'final_battery': node.current_battery,
-                    'packets_sent': node.packets_sent,
-                    'packets_received': node.packets_received,
-                    'is_active': node.is_active
-                }
-                for node in self.nodes.values()
-            }
-        }
+        # Performance metrics
+        print(f"\nNetwork Performance:")
+        delivered_total = sum(stats['delivered_packets'])
+        dropped_total = sum(stats['dropped_packets'])
+        total_packets = delivered_total + dropped_total
         
-        return report
+        if total_packets > 0:
+            overall_pdr = delivered_total / total_packets
+            print(f"  Total packets transmitted: {total_packets}")
+            print(f"  Packets delivered: {delivered_total}")
+            print(f"  Packets dropped: {dropped_total}")
+            print(f"  Overall PDR: {overall_pdr:.4f}")
         
-    def plot_results(self):
-        """Plot simulation results"""
-        if not self.metrics['simulation_time']:
-            print("No data to plot!")
-            return
+        if stats['delivered_packets']:
+            print(f"  Average packets delivered per round: {np.mean(stats['delivered_packets']):.2f}")
+            print(f"  Average packets dropped per round: {np.mean(stats['dropped_packets']):.2f}")
+        
+        # Clustering metrics
+        if stats['chs_per_round']:
+            print(f"\nClustering Performance:")
+            print(f"  Average CHs per round: {np.mean(stats['chs_per_round']):.2f}")
+            print(f"  Average cluster switches per round: {np.mean(stats['cluster_switches']):.2f}")
+            print(f"  Average load distribution (std): {np.mean(stats['load_distribution']):.4f}")
+        
+        # Real-time performance
+        if stats['real_time_ratio']:
+            print(f"\nReal-time Performance:")
+            print(f"  Average real-time ratio: {np.mean(stats['real_time_ratio']):.4f}")
+            total_met = sum(stats['met_deadline_packets'])
+            total_missed = sum(stats['missed_deadline_packets'])
+            if total_met + total_missed > 0:
+                overall_rt_ratio = total_met / (total_met + total_missed)
+                print(f"  Overall real-time ratio: {overall_rt_ratio:.4f}")
+        
+        # Energy analysis
+        if stats['total_energy']:
+            initial_energy = total_nodes * INIT_ENERGY
+            final_energy = stats['total_energy'][-1] if stats['total_energy'] else 0
+            energy_consumed = initial_energy - final_energy
             
-        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
-        fig.suptitle('EARLB Dataset-Based Simulation Results', fontsize=14, fontweight='bold')
+            print(f"\nEnergy Analysis:")
+            print(f"  Initial total energy: {initial_energy:.4f} J")
+            print(f"  Final total energy: {final_energy:.4f} J")
+            print(f"  Energy consumed: {energy_consumed:.4f} J")
+            if initial_energy > 0:
+                efficiency = final_energy / initial_energy
+                print(f"  Energy efficiency: {efficiency:.4f}")
         
-        times = self.metrics['simulation_time']
+        # Node lifetime analysis
+        if stats['first_death'] is not None:
+            print(f"\nNode Lifetime:")
+            print(f"  First node death: Round {stats['first_death']}")
+            if stats['last_death'] is not None:
+                print(f"  Last node death: Round {stats['last_death']}")
+                print(f"  Network lifetime: {stats['last_death']} rounds")
         
-        # Plot metrics
-        metrics_to_plot = [
-            ('packet_drop', 'Packet Drop Rate', 'red'),
-            ('pdr', 'Packet Delivery Ratio', 'blue'),
-            ('energy_consumption', 'Energy Consumption (%)', 'green'),
-            ('load_efficiency', 'Load Efficiency', 'orange'),
-            ('alive_nodes', 'Alive Nodes', 'purple'),
-            ('network_lifetime', 'Network Lifetime', 'brown')
-        ]
-        
-        for i, (metric, title, color) in enumerate(metrics_to_plot):
-            row, col = i // 3, i % 3
-            if metric in self.metrics and self.metrics[metric]:
-                axes[row, col].plot(times, self.metrics[metric], color=color, linewidth=2)
-                axes[row, col].set_title(title)
-                axes[row, col].set_xlabel('Time Steps')
-                axes[row, col].grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        
-        # Save plot
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f'earlb_dataset_results_{timestamp}.png'
-        plt.savefig(filename, dpi=300, bbox_inches='tight')
-        print(f"Results plot saved as {filename}")
-        plt.show()
-
-def compare_datasets(dataset_paths):
-    """Compare multiple datasets using EARLB algorithm"""
-    print("="*60)
-    print("EARLB Algorithm - Multi-Dataset Comparison")
-    print("="*60)
-    
-    results = {}
-    
-    for i, dataset_path in enumerate(dataset_paths):
-        print(f"\nProcessing Dataset {i+1}: {dataset_path}")
-        print("-" * 50)
-        
-        # Check if file exists
-        if not os.path.exists(dataset_path):
-            print(f"Error: File '{dataset_path}' not found! Skipping...")
-            continue
-            
-        try:
-            # Run simulation for this dataset
-            sim = EARLBDatasetSimulation(dataset_path)
-            metrics = sim.run_simulation()
-            report = sim.generate_report()
-            
-            if report:
-                results[f"Dataset_{i+1}"] = {
-                    'path': dataset_path,
-                    'metrics': metrics,
-                    'report': report
-                }
-                
-                # Display summary
-                ps = report['performance_summary']
-                print(f"Results for {dataset_path}:")
-                print(f"  Network Lifetime: {ps['network_lifetime_percentage']:.1f}%")
-                print(f"  Average PDR: {ps['average_pdr']:.3f}")
-                print(f"  Average Load Efficiency: {ps['average_load_efficiency']:.3f}")
-                print(f"  Total Energy Consumed: {ps['total_energy_consumed']:.2f}%")
-                
-        except Exception as e:
-            print(f"Error processing {dataset_path}: {e}")
-            continue
-    
-    # Generate comparison report
-    if len(results) > 1:
-        generate_comparison_report(results)
-    
-    return results
-
-def generate_comparison_report(results):
-    """Generate comparison report for multiple datasets"""
-    print("\n" + "="*60)
-    print("DATASET COMPARISON SUMMARY")
-    print("="*60)
-    
-    comparison_data = []
-    
-    for dataset_name, data in results.items():
-        ps = data['report']['performance_summary']
-        comparison_data.append({
-            'Dataset': dataset_name,
-            'Network_Lifetime_%': ps['network_lifetime_percentage'],
-            'Average_PDR': ps['average_pdr'],
-            'Load_Efficiency': ps['average_load_efficiency'],
-            'Energy_Consumed_%': ps['total_energy_consumed']
-        })
-    
-    # Create comparison DataFrame
-    comparison_df = pd.DataFrame(comparison_data)
-    print("\nPerformance Comparison:")
-    print(comparison_df.to_string(index=False))
-    
-    # Save comparison report
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    comparison_file = f'earlb_comparison_report_{timestamp}.json'
-    
-    with open(comparison_file, 'w') as f:
-        json.dump(results, f, indent=2, default=str)
-    print(f"\nComparison report saved as {comparison_file}")
-    
-    # Plot comparison
-    plot_comparison(comparison_df)
-
-def plot_comparison(comparison_df):
-    """Plot comparison charts"""
-    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-    fig.suptitle('EARLB Multi-Dataset Comparison', fontsize=14, fontweight='bold')
-    
-    metrics = ['Network_Lifetime_%', 'Average_PDR', 'Load_Efficiency', 'Energy_Consumed_%']
-    titles = ['Network Lifetime (%)', 'Average PDR', 'Load Efficiency', 'Energy Consumed (%)']
-    colors = ['blue', 'green', 'orange', 'red']
-    
-    for i, (metric, title, color) in enumerate(zip(metrics, titles, colors)):
-        row, col = i // 2, i % 2
-        axes[row, col].bar(comparison_df['Dataset'], comparison_df[metric], color=color, alpha=0.7)
-        axes[row, col].set_title(title)
-        axes[row, col].set_xlabel('Dataset')
-        axes[row, col].tick_params(axis='x', rotation=45)
-        axes[row, col].grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    
-    # Save comparison plot
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f'earlb_comparison_{timestamp}.png'
-    plt.savefig(filename, dpi=300, bbox_inches='tight')
-    print(f"Comparison plot saved as {filename}")
-    plt.show()
+        print("="*80)
 
 def main():
-    """Main function"""
-    print("="*60)
-    print("EARLB Algorithm - Dataset-Based Implementation")
-    print("Enhanced Adaptive Rotation Load Balancing for WSN")
-    print("="*60)
+    """Main execution function"""
+    print("=== NS-3 HEED Algorithm Dataset Analysis ===")
+    print("This simulation analyzes WSN performance using the HEED clustering algorithm")
+    print("with NS-3 network simulator integration.\n")
     
-    # OPTION 1: Single Dataset Analysis
-    # Simply change this path to your dataset file
-    dataset_path = "sensor_data.csv"  # Change this to your actual file path
+    # Get dataset path
+    if len(sys.argv) > 1:
+        dataset_path = sys.argv[1]
+    else:
+        dataset_path = input("Enter the path to your dataset file: ").strip()
     
-    # OPTION 2: Multiple Dataset Comparison
-    # Uncomment the lines below to compare multiple datasets
-    # dataset_paths = [
-    #     "dataset1.csv",
-    #     "dataset2.csv",
-    #     "dataset3.csv"
-    # ]
-    # results = compare_datasets(dataset_paths)
-    # return results
+    # Clean path
+    dataset_path = dataset_path.strip('"\'')
     
-    # OPTION 3: File Dialog (uncomment if you want to browse for file)
-    # try:
-    #     import tkinter as tk
-    #     from tkinter import filedialog
-    #     root = tk.Tk()
-    #     root.withdraw()  # Hide the main window
-    #     dataset_path = filedialog.askopenfilename(
-    #         title="Select your sensor dataset CSV file",
-    #         filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
-    #     )
-    #     if not dataset_path:
-    #         print("No file selected. Exiting.")
-    #         sys.exit(1)
-    # except ImportError:
-    #     print("tkinter not available. Using hardcoded path.")
-    
-    # Check if dataset exists
+    # Validate file exists
     if not os.path.exists(dataset_path):
-        print(f"Error: Dataset file '{dataset_path}' not found!")
-        print("Please update the dataset_path variable in the main() function")
-        print("Expected CSV format with columns:")
-        print("sort_id, date_d_m_y, time, sensor_id, sensor_type, temp_C, hpa_div_4, batterylevel, sensor_cycle")
-        sys.exit(1)
+        print(f"Error: Dataset file '{dataset_path}' not found.")
+        return
     
-    # Create and run simulation
-    sim = EARLBDatasetSimulation(dataset_path)
-    metrics = sim.run_simulation()
-    
-    # Generate report
-    report = sim.generate_report()
-    
-    if report:
-        # Display results
-        print("\n" + "="*50)
-        print("SIMULATION RESULTS")
-        print("="*50)
+    try:
+        # Create and run simulation
+        print("Initializing NS-3 HEED simulation...")
+        simulation = NS3HEEDSimulation()
         
-        ps = report['performance_summary']
-        print(f"Network Lifetime: {ps['network_lifetime_percentage']:.1f}%")
-        print(f"Average PDR: {ps['average_pdr']:.3f}")
-        print(f"Average Load Efficiency: {ps['average_load_efficiency']:.3f}")
-        print(f"Total Energy Consumed: {ps['total_energy_consumed']:.2f}%")
+        # Run simulation
+        results = simulation.run_simulation(dataset_path)
         
-        # Save report
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        report_file = f'earlb_dataset_report_{timestamp}.json'
-        with open(report_file, 'w') as f:
-            json.dump(report, f, indent=2, default=str)
-        print(f"Detailed report saved as {report_file}")
+        if results is None:
+            print("Simulation failed. Please check the dataset format and try again.")
+            return
         
-        # Plot results
-        sim.plot_results()
-    
-    return metrics, report
+        # Print results
+        simulation.print_comprehensive_results(results)
+        
+        print(f"\nSimulation completed successfully!")
+        print(f"Dataset: {dataset_path}")
+        print(f"Total simulation time: {results['total_rounds']} rounds")
+        
+    except Exception as e:
+        print(f"Simulation error: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
-    metrics, report = main()
+    main()
