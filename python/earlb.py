@@ -1,9 +1,4 @@
 #!/usr/bin/env python3
-"""
-Pure‑Python HEED simulation rewritten from the original NS‑3–dependent version.
-All NS‑3 bindings have been removed, so the script can be executed with a plain
-Python 3 interpreter.  Functionality and data‑loading semantics remain the same.
-"""
 
 import sys
 import os
